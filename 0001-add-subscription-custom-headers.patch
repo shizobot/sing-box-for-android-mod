@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: patch <patch@example.com>
+Date: Sun, 15 Mar 2026 00:00:00 +0000
+Subject: [PATCH] feat: add custom headers (User-Agent, x-device-os, x-hwid) to subscription settings
+
+Adds three configurable HTTP headers to remote profile (subscription) settings:
+  - User-Agent      : override the default HTTP User-Agent sent during updates
+  - x-device-os     : custom OS identifier header
+  - x-hwid          : hardware/device identifier header
+
+Changes:
+  1. database/TypedProfile.kt          — three new nullable String columns
+  2. database/AppDatabase.kt           — Room migration v5 → v6
+  3. bg/UpdateProfileWork.kt           — inject headers into OkHttp request
+  4. ui/profile/EditProfileContentActivity.kt — UI fields for the three headers
+  5. res/layout/activity_edit_profile_content.xml — TextInputLayouts
+  6. res/values/strings.xml            — new string resources
+---
+ .../sfa/database/TypedProfile.kt                    |  18 +++-
+ .../sfa/database/AppDatabase.kt                     |  21 +++-
+ .../sfa/bg/UpdateProfileWork.kt                     |  28 ++++-
+ .../ui/profile/EditProfileContentActivity.kt        |  60 ++++++++++-
+ .../res/layout/activity_edit_profile_content.xml    |  78 ++++++++++++++
+ .../main/res/values/strings.xml                     |   8 ++
+ 6 files changed, 207 insertions(+), 6 deletions(-)
+
+diff --git a/app/src/main/java/io/nekohasekai/sfa/database/TypedProfile.kt b/app/src/main/java/io/nekohasekai/sfa/database/TypedProfile.kt
+index aaaaaaa..bbbbbbb 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/database/TypedProfile.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/database/TypedProfile.kt
+@@ -1,6 +1,7 @@
+ package io.nekohasekai.sfa.database
+ 
+ import androidx.room.ColumnInfo
++import androidx.room.ColumnInfo
+ import androidx.room.Entity
+ import androidx.room.PrimaryKey
+ import java.util.Date
+@@ -24,6 +25,21 @@ data class TypedProfile(
+     @ColumnInfo(name = "last_updated")
+     val lastUpdated: Date = Date(),
+ 
++    // ── Custom subscription HTTP headers ──────────────────────────────────
++    // Stored as nullable strings; null means "do not send this header".
++
++    /** Override the HTTP User-Agent header used when fetching this profile. */
++    @ColumnInfo(name = "header_user_agent")
++    val headerUserAgent: String? = null,
++
++    /**
++     * Value for the custom `x-device-os` header sent during subscription
++     * updates (e.g. "android", "android/14").
++     */
++    @ColumnInfo(name = "header_x_device_os")
++    val headerXDeviceOs: String? = null,
++
++    /**
++     * Value for the custom `x-hwid` header used to identify the device to
++     * the subscription provider.
++     */
++    @ColumnInfo(name = "header_x_hwid")
++    val headerXHwid: String? = null,
++
+ ) {
+     enum class Type {
+         Local, Remote
+
+diff --git a/app/src/main/java/io/nekohasekai/sfa/database/AppDatabase.kt b/app/src/main/java/io/nekohasekai/sfa/database/AppDatabase.kt
+index ccccccc..ddddddd 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/database/AppDatabase.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/database/AppDatabase.kt
+@@ -1,11 +1,12 @@
+ package io.nekohasekai.sfa.database
+ 
+ import androidx.room.Database
++import androidx.room.migration.Migration
+ import androidx.room.Room
+ import androidx.room.RoomDatabase
+ import androidx.room.TypeConverters
+-import androidx.room.migration.Migration
+ import androidx.sqlite.db.SupportSQLiteDatabase
+ import io.nekohasekai.sfa.Application
+ 
+-@Database(entities = [Profile::class, TypedProfile::class], version = 5)
++@Database(entities = [Profile::class, TypedProfile::class], version = 6)
+ @TypeConverters(Converters::class)
+ abstract class AppDatabase : RoomDatabase() {
+ 
+@@ -15,6 +16,7 @@ abstract class AppDatabase : RoomDatabase() {
+     companion object {
+         val MIGRATION_1_2: Migration = object : Migration(1, 2) { /* … */ }
+         val MIGRATION_2_3: Migration = object : Migration(2, 3) { /* … */ }
+         val MIGRATION_3_4: Migration = object : Migration(3, 4) { /* … */ }
+         val MIGRATION_4_5: Migration = object : Migration(4, 5) { /* … */ }
++
++        /**
++         * v6: add three nullable TEXT columns for custom subscription headers.
++         * Existing rows receive NULL (= header not sent), preserving behaviour.
++         */
++        val MIGRATION_5_6: Migration = object : Migration(5, 6) {
++            override fun migrate(database: SupportSQLiteDatabase) {
++                database.execSQL(
++                    "ALTER TABLE typed_profiles ADD COLUMN header_user_agent TEXT"
++                )
++                database.execSQL(
++                    "ALTER TABLE typed_profiles ADD COLUMN header_x_device_os TEXT"
++                )
++                database.execSQL(
++                    "ALTER TABLE typed_profiles ADD COLUMN header_x_hwid TEXT"
++                )
++            }
++        }
+ 
+         val instance by lazy {
+             Room.databaseBuilder(
+@@ -25,7 +39,8 @@ abstract class AppDatabase : RoomDatabase() {
+                 .addMigrations(
+                     MIGRATION_1_2,
+                     MIGRATION_2_3,
+                     MIGRATION_3_4,
+                     MIGRATION_4_5,
++                    MIGRATION_5_6,
+                 )
+                 .build()
+         }
+
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/UpdateProfileWork.kt b/app/src/main/java/io/nekohasekai/sfa/bg/UpdateProfileWork.kt
+index eeeeeee..fffffff 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/UpdateProfileWork.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/UpdateProfileWork.kt
+@@ -1,8 +1,11 @@
+ package io.nekohasekai.sfa.bg
+ 
++import android.content.Context
+ import androidx.work.CoroutineWorker
+ import androidx.work.WorkerParameters
+-import android.content.Context
++import io.nekohasekai.sfa.database.AppDatabase
++import io.nekohasekai.sfa.database.TypedProfile
+ import io.nekohasekai.sfa.ktx.runOnDefaultDispatcher
++import okhttp3.OkHttpClient
+ import okhttp3.Request
+-import okhttp3.OkHttpClient
+ 
+ class UpdateProfileWork(
+     appContext: Context,
+@@ -18,18 +21,35 @@ class UpdateProfileWork(
+             val profileId = inputData.getLong(KEY_PROFILE_ID, -1L)
+             if (profileId == -1L) return@runOnDefaultDispatcher Result.failure()
+ 
+-            val profile = AppDatabase.instance.typedProfileDao().getById(profileId)
++            val profile: TypedProfile =
++                AppDatabase.instance.typedProfileDao().getById(profileId)
+                 ?: return@runOnDefaultDispatcher Result.failure()
+ 
+             if (profile.remoteURL.isBlank()) return@runOnDefaultDispatcher Result.failure()
+ 
+-            val request = Request.Builder()
++            // ── Build the HTTP request, injecting custom headers ─────────
++            val requestBuilder = Request.Builder()
+                 .url(profile.remoteURL)
+-                .build()
++
++            // User-Agent — fall back to the library/app default when not set
++            profile.headerUserAgent
++                ?.takeIf { it.isNotBlank() }
++                ?.let { requestBuilder.header("User-Agent", it) }
++
++            // x-device-os — e.g. "android" or "android/14"
++            profile.headerXDeviceOs
++                ?.takeIf { it.isNotBlank() }
++                ?.let { requestBuilder.header("x-device-os", it) }
++
++            // x-hwid — hardware / device identifier
++            profile.headerXHwid
++                ?.takeIf { it.isNotBlank() }
++                ?.let { requestBuilder.header("x-hwid", it) }
++
++            val request = requestBuilder.build()
+ 
+             val response = OkHttpClient().newCall(request).execute()
+             if (!response.isSuccessful) return@runOnDefaultDispatcher Result.retry()
+ 
+             val body = response.body?.string()
+                 ?: return@runOnDefaultDispatcher Result.failure()
+ 
+             // … rest of update logic unchanged …
+
+diff --git a/app/src/main/java/io/nekohasekai/sfa/ui/profile/EditProfileContentActivity.kt b/app/src/main/java/io/nekohasekai/sfa/ui/profile/EditProfileContentActivity.kt
+index ggggggg..hhhhhhh 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/ui/profile/EditProfileContentActivity.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/ui/profile/EditProfileContentActivity.kt
+@@ -1,6 +1,7 @@
+ package io.nekohasekai.sfa.ui.profile
+ 
++import android.os.Bundle
+ import android.view.Menu
+ import android.view.MenuItem
+-import android.os.Bundle
++import android.view.View
+ import androidx.lifecycle.lifecycleScope
+ import io.nekohasekai.sfa.R
+ import io.nekohasekai.sfa.database.AppDatabase
+@@ -8,6 +9,7 @@ import io.nekohasekai.sfa.database.TypedProfile
+ import io.nekohasekai.sfa.databinding.ActivityEditProfileContentBinding
+ import io.nekohasekai.sfa.ktx.runOnDefaultDispatcher
+ import io.nekohasekai.sfa.ui.shared.BaseActivity
++import kotlinx.coroutines.launch
+ 
+ class EditProfileContentActivity : BaseActivity() {
+ 
+@@ -40,6 +42,34 @@ class EditProfileContentActivity : BaseActivity() {
+             binding.autoUpdateSwitch.isChecked = profile.autoUpdate
+             binding.autoUpdateIntervalLayout.visibility =
+                 if (profile.autoUpdate) View.VISIBLE else View.GONE
++
++            // ── Custom header fields — shown only for Remote profiles ─────
++            val isRemote = profile.type == TypedProfile.Type.Remote
++            binding.headersSection.visibility = if (isRemote) View.VISIBLE else View.GONE
++
++            binding.headerUserAgentInput.setText(profile.headerUserAgent.orEmpty())
++            binding.headerXDeviceOsInput.setText(profile.headerXDeviceOs.orEmpty())
++            binding.headerXHwidInput.setText(profile.headerXHwid.orEmpty())
+         }
+ 
+         binding.autoUpdateSwitch.setOnCheckedChangeListener { _, isChecked ->
+@@ -63,6 +93,36 @@ class EditProfileContentActivity : BaseActivity() {
+ 
+     /** Persist all form values back to the database. */
+     private fun saveProfile() {
++        val currentProfile = profile ?: return
++
++        // Read header values; treat blank as null (= header not sent)
++        val newUserAgent =
++            binding.headerUserAgentInput.text?.toString()?.trim()?.ifBlank { null }
++        val newXDeviceOs =
++            binding.headerXDeviceOsInput.text?.toString()?.trim()?.ifBlank { null }
++        val newXHwid =
++            binding.headerXHwidInput.text?.toString()?.trim()?.ifBlank { null }
++
++        val updated = currentProfile.copy(
++            name = binding.nameInput.text?.toString()?.trim() ?: currentProfile.name,
++            remoteURL = binding.remoteURLInput.text?.toString()?.trim()
++                ?: currentProfile.remoteURL,
++            autoUpdate = binding.autoUpdateSwitch.isChecked,
++            autoUpdateInterval = binding.autoUpdateIntervalInput.text
++                ?.toString()?.toIntOrNull() ?: currentProfile.autoUpdateInterval,
++            // ── custom headers ───────────────────────────────────────────
++            headerUserAgent = newUserAgent,
++            headerXDeviceOs = newXDeviceOs,
++            headerXHwid = newXHwid,
++        )
++
+         lifecycleScope.launch {
+             runOnDefaultDispatcher {
+-                // existing save logic
++                AppDatabase.instance.typedProfileDao().update(updated)
+             }
+             finish()
+         }
+
+diff --git a/app/src/main/res/layout/activity_edit_profile_content.xml b/app/src/main/res/layout/activity_edit_profile_content.xml
+index iiiiiii..jjjjjjj 100644
+--- a/app/src/main/res/layout/activity_edit_profile_content.xml
++++ b/app/src/main/res/layout/activity_edit_profile_content.xml
+@@ -1,4 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
++<!-- activity_edit_profile_content.xml  (additions only — keep existing views) -->
+ <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     android:layout_width="match_parent"
+@@ -80,5 +81,82 @@
+         <!-- … existing autoUpdate, interval, name, remoteURL fields … -->
+ 
++        <!-- ════════════════════════════════════════════════════════════════
++             Custom HTTP Headers section — visible only for Remote profiles
++             ════════════════════════════════════════════════════════════════ -->
++        <LinearLayout
++            android:id="@+id/headersSection"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:orientation="vertical"
++            android:visibility="gone"
++            android:paddingTop="8dp"
++            android:paddingBottom="8dp">
++
++            <!-- Section title -->
++            <TextView
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginStart="16dp"
++                android:layout_marginEnd="16dp"
++                android:layout_marginTop="8dp"
++                android:layout_marginBottom="4dp"
++                android:text="@string/subscription_headers_title"
++                android:textAppearance="?attr/textAppearanceTitleSmall"
++                android:textColor="?attr/colorPrimary" />
++
++            <!-- User-Agent -->
++            <com.google.android.material.textfield.TextInputLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginStart="16dp"
++                android:layout_marginEnd="16dp"
++                android:layout_marginTop="8dp"
++                android:hint="@string/subscription_header_user_agent"
++                style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
++
++                <com.google.android.material.textfield.TextInputEditText
++                    android:id="@+id/headerUserAgentInput"
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:inputType="text"
++                    android:maxLines="1"
++                    android:imeOptions="actionNext" />
++
++            </com.google.android.material.textfield.TextInputLayout>
++
++            <!-- x-device-os -->
++            <com.google.android.material.textfield.TextInputLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginStart="16dp"
++                android:layout_marginEnd="16dp"
++                android:layout_marginTop="8dp"
++                android:hint="@string/subscription_header_x_device_os"
++                style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
++
++                <com.google.android.material.textfield.TextInputEditText
++                    android:id="@+id/headerXDeviceOsInput"
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:inputType="text"
++                    android:maxLines="1"
++                    android:imeOptions="actionNext" />
++
++            </com.google.android.material.textfield.TextInputLayout>
++
++            <!-- x-hwid -->
++            <com.google.android.material.textfield.TextInputLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginStart="16dp"
++                android:layout_marginEnd="16dp"
++                android:layout_marginTop="8dp"
++                android:hint="@string/subscription_header_x_hwid"
++                style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
++
++                <com.google.android.material.textfield.TextInputEditText
++                    android:id="@+id/headerXHwidInput"
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:inputType="text"
++                    android:maxLines="1"
++                    android:imeOptions="actionDone" />
++
++            </com.google.android.material.textfield.TextInputLayout>
++
++        </LinearLayout>
++        <!-- end headersSection -->
++
+     </LinearLayout>
+ </ScrollView>
+
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index kkkkkkk..lllllll 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -190,4 +190,12 @@
+     <!-- … existing strings … -->
+ 
++    <!-- ── Custom subscription headers (added by patch) ─────────────────── -->
++    <string name="subscription_headers_title">Custom Request Headers</string>
++    <string name="subscription_header_user_agent">User-Agent (optional)</string>
++    <string name="subscription_header_x_device_os">x-device-os (optional)</string>
++    <string name="subscription_header_x_hwid">x-hwid (optional)</string>
++
+ </resources>
+-- 
+2.43.0
